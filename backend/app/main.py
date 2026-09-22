@@ -3,10 +3,15 @@ import numpy as np
 from collections import defaultdict, Counter
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel
+from . import alerts as alert_lib
 
 app = FastAPI(title="Log Anomaly Detector")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+
+# 当前生效的告警分级标准与静默时段（可通过 /api/alerts/config 配置）
+ALERT_CONFIG = alert_lib.default_config()
 
 LOG_TEMPLATES = {
     "nginx": {
@@ -75,6 +80,13 @@ class DetectRequest(BaseModel):
     query: str = ""
 
 
+class AlertConfigRequest(BaseModel):
+    grades: list
+    silences: list = []
+    scope: str = "subsequent"   # subsequent=只影响后续告警, backfill=同时回填已有条目
+    alerts: list = []           # backfill 时需要重新处理的已有原始告警
+
+
 @app.post("/api/generate")
 def generate_logs(req: GenerateRequest):
     tmpl = LOG_TEMPLATES.get(req.type, LOG_TEMPLATES["nginx"])
@@ -139,22 +151,27 @@ def analyze_logs(logs_data, rules, query):
             "timestamp": logs[i * window_size]["timestamp"] if i * window_size < len(logs) else ""
         })
 
-    # Alert rules
-    alerts = []
-    for i, rule in enumerate(rules):
+    # ---- 原始告警：先按统一标准折算 0~10 分数，分档交由可配置标准完成 ----
+    raw_alerts = []
+    for rule in rules:
         rule = rule if isinstance(rule, dict) else {}
-        for w in windows:
-            if rule.get("type") == "level" and w["levels"].get("ERROR", 0) > rule.get("threshold", 5):
-                alerts.append({
-                    "id": len(alerts) + 1, "ruleName": rule.get("name", "高频ERROR"),
-                    "severity": "high", "message": f"窗口{w['start']}内ERROR日志{w['levels']['ERROR']}条超过阈值{rule.get('threshold',5)}",
-                    "timestamp": time.strftime("%H:%M:%S")
+        for wi, w in enumerate(windows):
+            err_count = w["levels"].get("ERROR", 0)
+            if rule.get("type") == "level" and err_count > rule.get("threshold", 5):
+                thr = max(rule.get("threshold", 5), 1)
+                raw_alerts.append({
+                    "ruleName": rule.get("name", "高频ERROR"),
+                    "windowIndex": wi,
+                    "score": round(min(10.0, 3.0 * err_count / thr), 2),
+                    "message": f"窗口{w['start']}内ERROR日志{err_count}条超过阈值{thr}"
                 })
             if rule.get("type") == "count" and w["count"] > rule.get("threshold", 200):
-                alerts.append({
-                    "id": len(alerts) + 1, "ruleName": rule.get("name", "异常流量"),
-                    "severity": "medium", "message": f"窗口{w['start']}日志量{w['count']}超过阈值",
-                    "timestamp": time.strftime("%H:%M:%S")
+                thr = max(rule.get("threshold", 200), 1)
+                raw_alerts.append({
+                    "ruleName": rule.get("name", "异常流量"),
+                    "windowIndex": wi,
+                    "score": round(min(10.0, 3.0 * w["count"] / thr), 2),
+                    "message": f"窗口{w['start']}日志量{w['count']}条超过阈值{thr}"
                 })
 
     # Full-text search with TF-IDF
@@ -168,20 +185,87 @@ def analyze_logs(logs_data, rules, query):
                 scored.append((score, log))
         logs = [l for _, l in sorted(scored, key=lambda x: x[0], reverse=True)]
 
-    # Add non-rule alerts for high anomaly windows  
+    # Add non-rule alerts for high anomaly windows（同样折算为统一分数）
     for a in anomalies:
         if a["isAnomaly"]:
-            alerts.append({
-                "id": len(alerts) + 1, "ruleName": "统计异常检测",
-                "severity": "critical" if a["sigmaScore"] > 4 else "high",
-                "message": f"窗口{a['windowIndex']}: 3-sigma={a['sigmaScore']}, IQR={a['iqrScore']}",
-                "timestamp": a["timestamp"]
+            raw_alerts.append({
+                "ruleName": "统计异常检测",
+                "windowIndex": a["windowIndex"],
+                "score": round(min(10.0, max(a["sigmaScore"] * 2.0, a["iqrScore"])), 2),
+                "message": f"窗口{a['windowIndex']}: 3-sigma={a['sigmaScore']}, IQR={a['iqrScore']}"
             })
+
+    raw_alerts = raw_alerts[:100]
+    _assign_timeline(raw_alerts, windows)
+    alerts, alert_stats = alert_lib.apply_config(raw_alerts, ALERT_CONFIG)
 
     return {
         "logs": logs[:200],
         "windows": windows,
         "anomalies": anomalies,
-        "alerts": alerts[:20],
+        "alerts": alerts,
+        "rawAlerts": raw_alerts,
+        "alertStats": alert_stats,
+        "alertConfig": public_config(ALERT_CONFIG),
         "totalLogs": n
     }
+
+
+def _assign_timeline(raw_alerts, windows):
+    """为原始告警合成一天内的时刻（最近 10 分钟均匀铺开），用于静默时段判定与展示。"""
+    nwin = len(windows) or 1
+    now = time.time()
+    span = 600.0 / nwin
+    for a in raw_alerts:
+        t = now - (nwin - 1 - int(a.get("windowIndex", 0))) * span
+        a["timeSec"] = int(time.mktime(time.localtime(t))) % 86400
+        a["timestamp"] = time.strftime("%H:%M:%S", time.localtime(t))
+        a.setdefault("severity", "")
+
+
+def public_config(cfg):
+    """对外配置（去掉内部计算字段）。"""
+    return {
+        "grades": [dict(g) for g in cfg["grades"]],
+        "silences": [
+            {"id": s["id"], "start": s["start"], "end": s["end"], "scope": s.get("scope", "")}
+            for s in cfg["silences"]
+        ],
+    }
+
+
+@app.get("/api/alerts/config")
+def get_alert_config():
+    return {"config": public_config(ALERT_CONFIG)}
+
+
+@app.post("/api/alerts/config")
+def save_alert_config(req: AlertConfigRequest):
+    global ALERT_CONFIG
+    submitted = {"grades": req.grades, "silences": req.silences}
+    result = alert_lib.validate_config(submitted)
+    if not result["valid"]:
+        # 严重级别填错 / 静默起止颠倒：不允许保存，逐项指出不合格项
+        note = alert_lib.describe_config(submitted, result, req.scope)
+        return JSONResponse(status_code=422, content={
+            "ok": False,
+            "valid": False,
+            "errors": result["errors"],
+            "warnings": result["warnings"],
+            "note": note,
+            "config": public_config(ALERT_CONFIG),
+        })
+
+    ALERT_CONFIG = result["normalized"]
+    resp = {"ok": True, "valid": True, "errors": [], "warnings": result["warnings"],
+            "note": alert_lib.describe_config(ALERT_CONFIG, result, req.scope),
+            "config": public_config(ALERT_CONFIG)}
+
+    if req.scope == "backfill":
+        # 同时回填已有条目：列表与图表共用这一份重新分档后的结果
+        alerts, stats = alert_lib.apply_config(req.alerts, ALERT_CONFIG)
+        resp.update({
+            "note": alert_lib.describe_config(ALERT_CONFIG, result, "backfill", stats),
+            "alerts": alerts, "alertStats": stats,
+        })
+    return resp

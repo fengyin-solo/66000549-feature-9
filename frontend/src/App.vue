@@ -23,18 +23,22 @@
     <div class="bottom-row">
       <TrendChart />
       <HeatmapChart />
+      <AlertTimelineChart />
     </div>
   </div>
 </template>
 
 <script setup lang="ts">
+import { onMounted } from 'vue'
 import LogTable from './components/LogTable.vue'
 import AnomalyChart from './components/AnomalyChart.vue'
 import AlertPanel from './components/AlertPanel.vue'
 import TrendChart from './components/TrendChart.vue'
 import HeatmapChart from './components/HeatmapChart.vue'
+import AlertTimelineChart from './components/AlertTimelineChart.vue'
 import { useLogStore } from './store/log'
 const store = useLogStore()
+onMounted(() => { store.loadAlertConfig().catch(() => { /* 后端未启动时静默 */ }) })
 </script>
 
 <style>
@@ -46,5 +50,5 @@ body{font-family:system-ui,monospace;background:#0f172a;color:#e2e8f0}
 .toolbar{display:flex;gap:8px;align-items:center}
 .main-grid{display:grid;grid-template-columns:1fr 400px;gap:12px;padding:12px 20px;min-height:50vh}
 .grid-col{overflow:hidden}
-.bottom-row{display:grid;grid-template-columns:1fr 1fr;gap:12px;padding:0 20px 16px}
+.bottom-row{display:grid;grid-template-columns:1fr 1fr 1fr;gap:12px;padding:0 20px 16px}
 </style>
